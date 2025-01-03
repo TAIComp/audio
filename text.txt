@@ -1,0 +1,20 @@
+I want to optimize my `audio.py` code by removing unnecessary imports and avoiding duplicated functionality. The file currently imports the following modules:  
+
+- `from aiHandler import AIHandler`  
+- `from interruption import InterruptionHandler, ListeningState`  
+- `from audio_utils import initialize_audio`  
+- `from state_management import AudioState`  
+- `from watchdog import WatchdogMonitor`  
+- `from cleanup import CleanupHandler`  
+- `from tts_handler import TTSHandler`  
+- `from stt_handler import STTHandler`  
+.  
+
+**Important:** Please do not delete any part of `audio.py` unless it is confirmed to be duplicated in another file or completely unused. Ensure that all functionality in `audio.py` remains intact after refactoring.  
+
+Your task is to:  
+1. Check if all the listed imports are used in `audio.py`.  
+2. Identify duplicated functions in `audio.py` and other files.  
+
+
+Thank you!

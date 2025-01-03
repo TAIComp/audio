@@ -9,7 +9,7 @@ from datetime import datetime
 from google.cloud import texttospeech
 import pygame
 from pathlib import Path
-from enum import Enum
+import queue
 import random
 import sounddevice as sd
 from pynput import keyboard
@@ -17,7 +17,15 @@ import difflib
 import numpy as np
 import re
 from dotenv import load_dotenv
-from aiHandler import AIHandler
+from ai_handler import AIHandler
+from interruption import InterruptionHandler, ListeningState
+from audio_utils import initialize_audio
+from state_management import AudioState
+from watchdog import WatchdogMonitor
+from cleanup import CleanupHandler
+from tts_handler import TTSHandler
+from stt_handler import STTHandler
+from audio_processing import AudioProcessor
 
 # Load environment variables from .env file
 load_dotenv()
@@ -55,44 +63,17 @@ import queue
 import threading
 from google.cloud import speech
 
-class ListeningState(Enum):
-    FULL_LISTENING = "full_listening"
-    INTERRUPT_ONLY = "interrupt_only"
-
-def initialize_audio():
-    """Initialize audio-related settings and suppress warnings."""
-    # Load environment variables
-    load_dotenv()
-
-    # Verify credentials path
-    credentials_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
-    if not credentials_path or not os.path.exists(credentials_path):
-        raise Exception(f"Google credentials file not found at: {credentials_path}")
-
-    # Suppress ALSA warnings
-    warnings.filterwarnings("ignore", category=RuntimeWarning, module="pygame.mixer")
-
-    # Redirect ALSA errors to /dev/null
-    try:
-        ERROR_HANDLER_FUNC = CFUNCTYPE(None, c_char_p, c_int, c_char_p, c_int, c_char_p)
-        def py_error_handler(filename, line, function, err, fmt):
-            return  # Just return instead of pass
-
-        c_error_handler = ERROR_HANDLER_FUNC(py_error_handler)
-        
-        try:
-            asound = cdll.LoadLibrary('libasound.so.2')
-            asound.snd_lib_error_set_handler(c_error_handler)
-        except OSError:
-            print("Warning: Could not load ALSA library. Audio might not work properly.")
-            
-    except Exception as e:
-        print(f"Warning: Could not set ALSA error handler: {e}")
-
 class AudioTranscriber:
     def __init__(self):
+        self.state = AudioState()
         try:
-            # Initialize audio settings first (now using local function)
+            # Initialize STT Handler first
+            self.stt_handler = STTHandler()
+            
+            # Get RATE from STT Handler for other components
+            self.RATE = self.stt_handler.RATE
+            
+            # Initialize audio settings first
             initialize_audio()
             
             # Initialize pygame mixer with error handling
@@ -109,8 +90,6 @@ class AudioTranscriber:
             self.stop_generation = False
             
             # Initialize audio parameters
-            self.RATE = 16000
-            self.CHUNK = int(self.RATE / 10)  # 100ms chunks
             self.current_sentence = ""
             self.last_transcript = ""
             
@@ -147,34 +126,11 @@ class AudioTranscriber:
             self.is_processing = False
             self.last_sentence_complete = False
 
-            # Add Text-to-Speech client
-            self.tts_client = texttospeech.TextToSpeechClient()
-            
-            # Configure Text-to-Speech with a male voice
-            self.voice = texttospeech.VoiceSelectionParams(
-                language_code="en-US",
-                name="en-US-Casual-K",  # Casual male voice
-                ssml_gender=texttospeech.SsmlVoiceGender.MALE  # Changed from NEUTRAL to MALE
-            )
-            
-            self.audio_config = texttospeech.AudioConfig(
-                audio_encoding=texttospeech.AudioEncoding.MP3,
-                speaking_rate=1.0,  # Normal speed
-                pitch=0.0  # Normal pitch
-            )
+            # Initialize TTS Handler
+            self.tts_handler = TTSHandler()
             
             # Add new attributes
             self.listening_state = ListeningState.FULL_LISTENING
-            self.interrupt_commands = {
-                "stop", "end", "shut up",
-                "please stop", "stop please",
-                "please end", "end please",
-                "shut up please", "please shut up",
-                "okay stop", "ok stop",
-                "can you stop", "could you stop",
-                "would you stop", "can you be quiet",
-                "silence", "pause"
-            }
             self.is_speaking = False
             
             # Update OpenAI model
@@ -228,14 +184,16 @@ class AudioTranscriber:
             self.last_activity_time = time.time()
             self.activity_timeout = 300  # Changed from 30 to 300 seconds
             
-            # Start watchdog thread
-            self.watchdog_thread = threading.Thread(target=self.watchdog_monitor, daemon=True)
-            self.watchdog_thread.start()
+            # Initialize handlers
+            self.cleanup_handler = CleanupHandler(self)
+            self.watchdog = WatchdogMonitor(self)
+            self.interrupt_handler = InterruptionHandler()
+            
+            # Start watchdog monitoring
+            self.watchdog.start_monitoring()
 
-            # Add new variables for interrupt detection
-            self.current_interrupt_buffer = ""
-            self.interrupt_buffer_timeout = 2.0  # seconds
-            self.last_interrupt_buffer_update = time.time()
+            # Initialize AudioProcessor
+            self.processor = AudioProcessor(self)
 
         except Exception as e:
             print(f"Error during initialization: {e}")
@@ -281,10 +239,10 @@ class AudioTranscriber:
                 dtype=self.MONITOR_DTYPE,
                 samplerate=self.RATE,
                 callback=audio_callback,
-                blocksize=2048,  # Increased block size for stability
+                blocksize=2048,
                 latency='high',
-                device=None,  # Use default device
-                prime_output_buffers_using_stream_callback=True  # Help prevent underflows
+                device=None,
+                prime_output_buffers_using_stream_callback=True
             )
             
             # Start the stream in a try-except block
@@ -312,900 +270,21 @@ class AudioTranscriber:
         """Wrapper for AI handler method"""
         return self.aiHandler.get_ai_response(text)
 
-    def reset_state(self, force=False):
-        """Reset the transcriber state."""
-        try:
-            self.is_speaking = False
-            self.is_processing = False
-            self.stop_generation = False
-            self.current_sentence = ""
-            self.last_transcript = ""
-            self.last_final_transcript = ""
-            self.last_sentence_complete = False
-            self.last_interim_timestamp = time.time()
-            self._last_state = None
-            
-            # Ensure pygame mixer is in a clean state
-            try:
-                if pygame.mixer.get_init():
-                    pygame.mixer.music.unload()
-                    pygame.mixer.quit()
-            except:
-                pass
-            
-            print("\nListening... (Press ` to interrupt)")
-        except Exception as e:
-            print(f"Error resetting state: {e}")
-
-    def text_to_speech(self, text):
-        """Convert text to speech and save as MP3."""
-        try:
-            synthesis_input = texttospeech.SynthesisInput(text=text)
-            
-            response = self.tts_client.synthesize_speech(
-                input=synthesis_input,
-                voice=self.voice,
-                audio_config=self.audio_config
-            )
-            
-            # Create output directory if it doesn't exist
-            output_dir = Path("ai_responses")
-            output_dir.mkdir(exist_ok=True)
-            
-            # Use a fixed filename instead of timestamp
-            output_path = output_dir / "latest_response.mp3"
-            
-            # Save the audio file (overwrites existing file)
-            with open(output_path, "wb") as out:
-                out.write(response.audio_content)
-                
-            return output_path
-            
-        except Exception as e:
-            print(f"Text-to-Speech error: {e}")
-            return None
-
-    def play_audio_response(self, audio_path):
-        """Modified to handle mic monitoring during playback."""
-        try:
-            self.is_speaking = True
-            self.listening_state = ListeningState.INTERRUPT_ONLY
-            
-            # Clear any pending transcripts and audio data
-            self.aggressive_cleanup()
-            
-            # Temporarily disable mic monitoring during playback
-            self.monitoring_active = False
-            
-            pygame.mixer.music.load(str(audio_path))
-            pygame.mixer.music.play()
-            
-            while pygame.mixer.music.get_busy():
-                pygame.time.Clock().tick(10)
-                if not self.is_speaking:  # Check if interrupted
-                    pygame.mixer.music.stop()
-                    break
-                    
-        except Exception as e:
-            print(f"Audio playback error: {e}")
-        finally:
-            # Aggressive cleanup before resetting states
-            self.aggressive_cleanup()
-            
-            # Set the last speaking timestamp
-            self._last_speaking_time = time.time()
-            
-            # Re-enable mic monitoring after playback
-            self.monitoring_active = True
-            
-            # Reset all necessary states after audio finishes
-            self.is_speaking = False
-            self.listening_state = ListeningState.FULL_LISTENING
-            self.current_audio_playing = False
-            self.is_processing = False
-            self.pending_response = None
-            
-            # Final cleanup
-            self.aggressive_cleanup()
-            print("\nListening... (Press ` to interrupt)")
-
-    def check_silence(self):
-        """Check for silence and process accordingly."""
-        while True:
-            try:
-                time.sleep(0.1)
-                # Skip if already processing or speaking
-                if self.is_processing or self.is_speaking:
-                    continue
-
-                current_time = datetime.now()
-                silence_duration = (current_time - self.last_speech_time).total_seconds()
-                
-                if self.last_final_transcript and not self.is_processing:
-                    # Get completion status for the current sentence
-                    is_complete = self.aiHandler.is_sentence_complete(self.last_final_transcript)
-                    
-                    # Adjusted silence thresholds
-                    if is_complete and silence_duration >= 0.7:  # Reduced from 1.0
-                        print(f"\nProcessing after {silence_duration:.1f} seconds of silence")
-                        if not self.is_processing:  # Double-check to prevent race conditions
-                            self.is_processing = True
-                            try:
-                                # Process in a new thread to prevent blocking
-                                processing_thread = threading.Thread(
-                                    target=self.process_complete_sentence,
-                                    args=(self.last_final_transcript,),
-                                    daemon=True
-                                )
-                                processing_thread.start()
-                            except Exception as e:
-                                print(f"Error in silence check processing: {e}")
-                                self.reset_state()
-                            
-            except Exception as e:
-                print(f"Error in check_silence: {e}")
-                time.sleep(1)
-
-    def audio_input_stream(self):
-        while True:
-            data = self.audio_queue.get()
-            if data is None:
-                break
-            yield data
-
-    def get_audio_input(self):
-        """Initialize audio input with error handling and device selection."""
-        try:
-            audio = pyaudio.PyAudio()
-            
-            # List available input devices
-            info = audio.get_host_api_info_by_index(0)
-            numdevices = info.get('deviceCount')
-            
-            # Find default input device
-            default_input = None
-            for i in range(numdevices):
-                device_info = audio.get_device_info_by_index(i)
-                if device_info.get('maxInputChannels') > 0:
-                    if device_info.get('defaultSampleRate') == self.RATE:
-                        default_input = i
-            
-            if default_input is None:
-                default_input = audio.get_default_input_device_info()['index']
-            
-            # Open the audio stream with explicit device selection
-            stream = audio.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=self.RATE,
-                input=True,
-                input_device_index=default_input,
-                frames_per_buffer=self.CHUNK,
-                stream_callback=self._fill_queue
-            )
-            
-            if not stream.is_active():
-                stream.start_stream()
-                
-            return stream, audio
-            
-        except Exception as e:
-            print(f"\nError initializing audio input: {e}")
-            print("Please check if your microphone is properly connected and permissions are set correctly.")
-            print("You may need to grant microphone access to the application.")
-            raise
-
-    def _fill_queue(self, in_data, frame_count, time_info, status_flags):
-        self.audio_queue.put(in_data)
-        return None, pyaudio.paContinue
-
     def handle_keyboard_interrupt(self):
-        """Handle keyboard interruption."""
-        current_time = time.time()
-        if current_time - self.last_interrupt_time >= self.interrupt_cooldown:
-            print("\nBacktick interrupt detected!")
-            self.handle_interrupt("keyboard")
-            # Clear audio queue and force a small delay
-            self.audio_queue.queue.clear()
-            time.sleep(0.2)  # Small delay to ensure clean state
+        """Delegate to InterruptionHandler"""
+        self.interrupt_handler.handle_keyboard_interrupt(self)
 
     def handle_interrupt(self, interrupt_type):
-        """Common interrupt handling logic."""
-        try:
-            current_time = time.time()
-            if current_time - self.last_interrupt_time >= self.interrupt_cooldown:
-                # Stop any ongoing audio playback
-                if pygame.mixer.music.get_busy():
-                    pygame.mixer.music.stop()
-                    pygame.mixer.music.unload()
-                    
-                # Aggressive cleanup before acknowledgment
-                self.aggressive_cleanup()
-                
-                # Clear audio queue before playing acknowledgment
-                while not self.audio_queue.empty():
-                    try:
-                        self.audio_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    
-                self.play_acknowledgment()
-                
-                # Aggressive cleanup after acknowledgment
-                self.aggressive_cleanup()
-                
-                # Add small delay and clear queue again after acknowledgment
-                time.sleep(0.3)
-                while not self.audio_queue.empty():
-                    try:
-                        self.audio_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                
-                # Signal to stop AI response generation
-                self.stop_generation = True
-                
-                # Reset all states
-                self.is_speaking = False
-                self.current_audio_playing = False
-                self.is_processing = False
-                self.pending_response = None
-                self.listening_state = ListeningState.FULL_LISTENING
-                
-                self.reset_state()
-                self.last_interrupt_time = current_time
-                
-                # Final aggressive cleanup before listening message
-                self.aggressive_cleanup()
-                print("\nListening... (Press ` to interrupt)")
-                
-        except Exception as e:
-            print(f"Error during interrupt handling: {e}")
-
-    def process_audio_stream(self):
-        try:
-            stream, audio = self.get_audio_input()
-            
-            requests = (
-                speech.StreamingRecognizeRequest(audio_content=content)
-                for content in self.audio_input_stream()
-            )
-
-            responses = self.client.streaming_recognize(
-                self.streaming_config,
-                requests
-            )
-
-            # Start the silence checking thread
-            silence_thread = threading.Thread(target=self.check_silence, daemon=True)
-            silence_thread.start()
-
-            print("Listening... (Press ` to interrupt)")
-
-            # Process responses with error handling
-            while True:
-                try:
-                    response = next(responses)
-                    if response:
-                        self.handle_responses([response])
-                        # Update activity timestamp on successful response
-                        self.last_activity_time = time.time()
-                except StopIteration:
-                    break
-                except Exception as e:
-                    print(f"Error processing response: {e}")
-                    time.sleep(0.1)
-                    continue
-        
-        except Exception as e:
-            print(f"Error occurred: {e}")
-        finally:
-            try:
-                stream.stop_stream()
-                stream.close()
-                audio.terminate()
-            except:
-                pass
-            try:
-                pygame.mixer.quit()
-            except:
-                pass
-            try:
-                self.keyboard_listener.stop()
-            except:
-                pass
-
-    def handle_responses(self, responses):
-        """Handle streaming responses with state-based processing and improved interrupt detection."""
-        for response in responses:
-            if not response.results:
-                continue
-
-            result = response.results[0]
-            transcript = result.alternatives[0].transcript.lower().strip()
-            current_time = time.time()
-            
-            # Update activity timestamp
-            self.update_activity()
-
-            # Reset last_speech_time when new speech is detected
-            if transcript:
-                self.last_speech_time = datetime.now()
-                # Also update activity time to prevent watchdog from triggering
-                self.last_activity_time = time.time()
-
-            # Check for interrupts during INTERRUPT_ONLY state first, before any other processing
-            if self.listening_state == ListeningState.INTERRUPT_ONLY:
-                if current_time - self.last_interrupt_time >= self.interrupt_cooldown:
-                    pattern = r'\b(?:' + '|'.join(re.escape(cmd) for cmd in self.interrupt_commands) + r')\b'
-                    is_interrupt = re.search(pattern, transcript) is not None
-                    
-                    if is_interrupt:
-                        print(f"\nInterrupt command detected: '{transcript}'")
-                        self.handle_interrupt("voice")
-                        # Clear everything
-                        self.aggressive_cleanup()
-                        return
-            
-            # Skip processing and clear everything if we're speaking or processing
-            if self.is_speaking or self.is_processing:
-                # Force clear everything
-                self.aggressive_cleanup()
-                # Create new streaming request to force reset recognition
-                self.streaming_config = speech.StreamingRecognitionConfig(
-                    config=self.config,
-                    interim_results=True
-                )
-                # Skip this response entirely
-                return
-
-            # Always verify state before processing
-            if self.listening_state != ListeningState.FULL_LISTENING:
-                self.aggressive_cleanup()
-                return
-
-            # Skip if we just finished processing
-            if hasattr(self, '_last_processing_time'):
-                if current_time - self._last_processing_time < 1.0:  # 1 second cooldown
-                    self.aggressive_cleanup()
-                    return
-
-            if result.is_final:
-                # Verify this isn't a stale response
-                if hasattr(self, '_last_transcript_time'):
-                    if current_time - self._last_transcript_time < 0.5:  # 500ms cooldown
-                        return
-
-                print(f'\nFinal: "{transcript}"')
-                self._last_transcript_time = current_time
-                
-                # Process only if in correct state
-                if self.listening_state == ListeningState.FULL_LISTENING and not self.is_processing:
-                    is_complete = self.aiHandler.is_sentence_complete(transcript)
-                    silence_duration = (datetime.now() - self.last_speech_time).total_seconds()
-                    
-                    should_process = (
-                        (is_complete and silence_duration >= 0.5) or
-                        (not is_complete and silence_duration >= 1.0)
-                    )
-                    
-                    if should_process:
-                        print(f"\nProcessing triggered - Sentence complete: {is_complete}, Silence: {silence_duration:.1f}s")
-                        self.is_processing = True
-                        self._last_processing_time = current_time
-                        self.last_final_transcript = transcript
-                        
-                        # Process in a separate thread
-                        processing_thread = threading.Thread(
-                            target=self.process_transcript,
-                            args=(transcript,),
-                            daemon=True
-                        )
-                        processing_thread.start()
-
-    def process_transcript(self, transcript):
-        """Process transcript with enhanced state management."""
-        try:
-            # Verify we should still process
-            if self.is_speaking or self.stop_generation:
-                self.aggressive_cleanup()
-                return
-
-            # Start AI response generation
-            response_future = threading.Thread(
-                target=self.process_complete_sentence,
-                args=(transcript,),
-                daemon=True
-            )
-            response_future.start()
-            response_future.join()  # Wait for processing to complete
-            
-        except Exception as e:
-            print(f"Error processing transcript: {e}")
-        finally:
-            self.is_processing = False
-            self.listening_state = ListeningState.FULL_LISTENING
-            self.aggressive_cleanup()
-            print("\nListening... (Press ` to interrupt)")
-
-    def process_complete_sentence(self, sentence):
-        try:
-            # Clear transcripts at the start of processing
-            self.last_transcript = ""
-            self.last_final_transcript = ""
-            
-            # Add this at the beginning
-            if self.stop_generation:
-                self.reset_state()
-                return
-
-            # Use the existing temp directory
-            temp_dir = Path("temp")
-            temp_dir.mkdir(exist_ok=True)
-            
-            # Create a unique subdirectory for this processing session
-            session_dir = temp_dir / f"audio_{int(time.time() * 1000)}"
-            session_dir.mkdir(exist_ok=True)
-            
-            # Set states at the beginning
-            self.listening_state = ListeningState.INTERRUPT_ONLY
-            print("\nChanging state to INTERRUPT_ONLY for processing")
-            
-            # Store the current sentence being processed
-            current_processing_sentence = sentence
-            
-            # Use thread-safe queue for audio buffer
-            audio_buffer = queue.Queue()
-            is_playing = False
-            playback_active = True
-            
-            def cleanup_old_sessions():
-                """Clean up old session directories."""
-                try:
-                    for old_dir in temp_dir.glob("audio_*"):
-                        if old_dir != session_dir:
-                            try:
-                                for file in old_dir.glob("*"):
-                                    file.unlink()
-                                old_dir.rmdir()
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-            
-            # Clean up old sessions before starting
-            cleanup_old_sessions()
-            
-            def play_audio_chunks():
-                nonlocal is_playing, playback_active
-                try:
-                    while playback_active and not self.stop_generation:
-                        if not is_playing and not audio_buffer.empty():
-                            try:
-                                chunk = audio_buffer.get_nowait()
-                                if chunk and chunk.exists():
-                                    try:
-                                        is_playing = True
-                                        
-                                        # Ensure pygame mixer is initialized
-                                        if not pygame.mixer.get_init():
-                                            pygame.mixer.init()
-                                        
-                                        pygame.mixer.music.load(str(chunk))
-                                        pygame.mixer.music.play()
-                                        
-                                        # Wait for current chunk to finish
-                                        while pygame.mixer.music.get_busy() and not self.stop_generation:
-                                            pygame.time.Clock().tick(10)
-                                        
-                                        # Cleanup after playing
-                                        pygame.mixer.music.unload()
-                                        chunk.unlink()
-                                        is_playing = False
-                                        
-                                    except Exception as e:
-                                        print(f"Error playing chunk: {e}")
-                                        is_playing = False
-                            except queue.Empty:
-                                time.sleep(0.1)
-                        else:
-                            time.sleep(0.1)
-                    
-                except Exception as e:
-                    print(f"Error in playback thread: {e}")
-                finally:
-                    is_playing = False
-                    try:
-                        pygame.mixer.music.unload()
-                    except:
-                        pass
-            
-            # Start audio playback thread
-            playback_thread = threading.Thread(target=play_audio_chunks, daemon=True)
-            playback_thread.start()
-            
-            try:
-                current_sentence = ""
-                chunk_counter = 0
-                
-                # Add error checking for OpenAI response
-                response_received = False
-                for text_chunk in self.get_ai_response(sentence):
-                    if text_chunk is None:
-                        print("\nError: No response received from AI")
-                        break
-                    response_received = True
-                    if self.stop_generation:
-                        break
-                    
-                    if text_chunk:
-                        current_sentence += text_chunk
-                        
-                        # Check if we have a complete sentence
-                        sentences = re.split(r'([.!?])\s*', current_sentence)
-                        
-                        # Process complete sentences
-                        while len(sentences) >= 2:  # We need at least [text, punctuation]
-                            sentence_text = sentences[0] + sentences[1]  # Combine text with punctuation
-                            
-                            try:
-                                # Convert sentence to speech
-                                synthesis_input = texttospeech.SynthesisInput(text=sentence_text)
-                                response = self.tts_client.synthesize_speech(
-                                    input=synthesis_input,
-                                    voice=self.voice,
-                                    audio_config=self.audio_config
-                                )
-                                
-                                # Save sentence to temporary file
-                                temp_path = session_dir / f"chunk_{chunk_counter}.mp3"
-                                with open(temp_path, "wb") as out:
-                                    out.write(response.audio_content)
-                                
-                                audio_buffer.put(temp_path)
-                                chunk_counter += 1
-                                
-                                # Remove processed sentence from the buffer
-                                sentences = sentences[2:]
-                                current_sentence = ''.join(sentences)
-                                
-                            except Exception as e:
-                                print(f"Error processing sentence: {e}")
-                                sentences = sentences[2:]
-                                current_sentence = ''.join(sentences)
-                                continue
-                
-                # Process any remaining text as the final sentence
-                if current_sentence.strip():
-                    try:
-                        synthesis_input = texttospeech.SynthesisInput(text=current_sentence)
-                        response = self.tts_client.synthesize_speech(
-                            input=synthesis_input,
-                            voice=self.voice,
-                            audio_config=self.audio_config
-                        )
-                        
-                        temp_path = session_dir / f"chunk_{chunk_counter}.mp3"
-                        with open(temp_path, "wb") as out:
-                            out.write(response.audio_content)
-                        
-                        audio_buffer.put(temp_path)
-                        
-                    except Exception as e:
-                        print(f"Error processing final sentence: {e}")
-                
-                # Wait for all audio to finish playing
-                while not audio_buffer.empty() or is_playing:
-                    if self.stop_generation:
-                        break
-                    time.sleep(0.1)
-                
-            except Exception as e:
-                print(f"Error generating response: {e}")
-            finally:
-                # Signal playback thread to stop
-                playback_active = False
-            
-            # Wait for playback thread to finish
-            playback_thread.join(timeout=2.0)
-            
-            # Cleanup session directory
-            try:
-                for file in session_dir.glob("*"):
-                    try:
-                        if file.exists():
-                            file.unlink()
-                    except Exception:
-                        pass
-                try:
-                    session_dir.rmdir()
-                except Exception:
-                    pass
-            except Exception as e:
-                print(f"Error cleaning up session directory: {e}")
-            
-            # Add this check
-            if not response_received:
-                print("\nNo valid response received, resetting state")
-                self.reset_state()
-                return
-
-        except Exception as e:
-            print(f"Error processing sentence: {e}")
-        finally:
-            # Ensure transcripts are cleared before returning to listening state
-            self.last_transcript = ""
-            self.last_final_transcript = ""
-            self.listening_state = ListeningState.FULL_LISTENING
-            self._last_state = None  # Reset state tracking
-            
-            # Aggressive cleanup before state reset
-            self.aggressive_cleanup()
-            
-            # Ensure states are always reset
-            self.is_speaking = False
-            self.is_processing = False
-            self.stop_generation = False
-            self.listening_state = ListeningState.FULL_LISTENING
-            
-            # Force clear the audio queue
-            while not self.audio_queue.empty():
-                try:
-                    self.audio_queue.get_nowait()
-                except queue.Empty:
-                    break
-            
-            # Second aggressive cleanup
-            self.aggressive_cleanup()
-            
-            # Update activity timestamp
-            self.update_activity()
-            
-            # Ensure pygame mixer is in a clean state
-            try:
-                if pygame.mixer.get_init():
-                    pygame.mixer.music.unload()
-                    pygame.mixer.quit()
-            except:
-                pass
-            
-            # Final aggressive cleanup before listening message
-            self.aggressive_cleanup()
-            print("\nListening... (Press ` to interrupt)")
-
-    def generate_response(self, sentence):
-        """Generate AI response in a separate thread."""
-        try:
-            print("\nGenerating response...")
-            response = self.get_ai_response(sentence)
-            if response:
-                print(f"\nAI Response: {response}")
-                self.pending_response = response
-        except Exception as e:
-            print(f"Error generating response: {e}")
-            self.pending_response = None
+        """Delegate to InterruptionHandler"""
+        self.interrupt_handler.handle_interrupt(self, interrupt_type)
 
     def play_acknowledgment(self):
-        """Play the prerecorded acknowledgment audio."""
-        try:
-            # Stop any currently playing audio
-            if pygame.mixer.music.get_busy():
-                pygame.mixer.music.stop()
-                pygame.mixer.music.unload()
-            
-            # Verify file exists
-            if not self.interrupt_audio_path.exists():
-                print(f"Error: Interruption audio file not found at {self.interrupt_audio_path}")
-                return
-            
-            # Load and play the interruption audio
-            pygame.mixer.music.load(str(self.interrupt_audio_path))
-            pygame.mixer.music.play()
-            
-            # Wait for the interruption audio to finish
-            while pygame.mixer.music.get_busy():
-                pygame.time.Clock().tick(10)
-            
-            # Cleanup
-            pygame.mixer.music.unload()
-            
-        except Exception as e:
-            print(f"Error playing acknowledgment: {e}")
+        """Delegate to InterruptionHandler"""
+        self.interrupt_handler.play_acknowledgment()
 
-    def watchdog_monitor(self):
-        """Monitor system health and recover from deadlocks."""
-        while self.watchdog_active:
-            try:
-                time.sleep(1)
-                current_time = time.time()
-                
-                # Only trigger recovery if we're truly stuck
-                if (current_time - self.last_activity_time > self.activity_timeout and 
-                    not self.is_processing and 
-                    not self.is_speaking and
-                    not self.audio_queue.empty()):  # Add this check
-                    
-                    print("\nWatchdog: System appears frozen, initiating recovery...")
-                    self.emergency_recovery()
-                    # Add a cooldown after recovery
-                    time.sleep(5)  # Wait 5 seconds before monitoring again
-                    self.last_activity_time = time.time()
-                    
-            except Exception as e:
-                print(f"Error in watchdog: {e}")
-                time.sleep(1)
-    
-    def emergency_recovery(self):
-        """Emergency recovery procedure."""
-        try:
-            with self.recovery_lock:
-                print("\nInitiating emergency recovery...")
-                
-                # Force stop all processing
-                self.stop_generation = True
-                self.is_processing = False
-                self.is_speaking = False
-                
-                # Clear audio queue
-                while not self.audio_queue.empty():
-                    try:
-                        self.audio_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                
-                # Clean up audio resources
-                try:
-                    if pygame.mixer.get_init():
-                        pygame.mixer.music.stop()
-                        pygame.mixer.music.unload()
-                        pygame.mixer.quit()
-                except:
-                    pass
-                
-                # Clean up streams
-                try:
-                    if hasattr(self, 'monitor_stream') and self.monitor_stream is not None:
-                        self.monitor_stream.stop()
-                        self.monitor_stream.close()
-                except:
-                    pass
-                
-                # Reinitialize system
-                time.sleep(1)  # Add delay before reinitializing
-                self.reinitialize_audio_system()
-                
-                # Reset states
-                self.reset_state(force=True)
-                
-                # Update activity timestamp
-                self.last_activity_time = time.time()
-                
-                print("\nEmergency recovery completed")
-                
-        except Exception as e:
-            print(f"Error in emergency recovery: {e}")
-            # Force reset everything
-            self.__init__()
-    
-    def update_activity(self):
-        """Update last activity timestamp."""
-        self.last_activity_time = time.time()
-    
-    def safe_process_audio_stream(self):
-        """Wrapper for process_audio_stream with error recovery."""
-        while True:
-            try:
-                self.process_audio_stream()
-            except Exception as e:
-                current_time = time.time()
-                if current_time - self.last_error_time > self.error_cooldown:
-                    self.error_count = 0
-                
-                self.error_count += 1
-                self.last_error_time = current_time
-                
-                print(f"\nError in audio stream: {e}")
-                
-                if self.error_count >= self.max_errors:
-                    print("\nToo many errors, initiating emergency recovery...")
-                    self.emergency_recovery()
-                    self.error_count = 0
-                else:
-                    self.reset_state(force=True)
-                
-                time.sleep(1)
-    
-    def __del__(self):
-        """Cleanup resources."""
-        try:
-            self.watchdog_active = False
-            if hasattr(self, 'watchdog_thread'):
-                self.watchdog_thread.join(timeout=1.0)
-            
-            # Stop all audio playback
-            if pygame.mixer.get_init():
-                pygame.mixer.music.stop()
-                pygame.mixer.music.unload()
-                pygame.mixer.quit()
-            
-            # Clean up monitor stream
-            if hasattr(self, 'monitor_stream') and self.monitor_stream is not None:
-                self.monitor_stream.stop()
-                self.monitor_stream.close()
-            
-            # Clean up temporary files
-            temp_dir = Path("temp")
-            if temp_dir.exists():
-                for session_dir in temp_dir.glob("audio_*"):
-                    try:
-                        for file in session_dir.glob("*"):
-                            try:
-                                if file.exists():
-                                    file.unlink()
-                            except Exception:
-                                pass
-                        try:
-                            session_dir.rmdir()
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-                
-        except Exception as e:
-            print(f"Cleanup error: {e}")
-
-    def reinitialize_audio_system(self):
-        """Reinitialize audio system after recovery."""
-        try:
-            # Reinitialize pygame mixer
-            if pygame.mixer.get_init():
-                pygame.mixer.quit()
-            pygame.mixer.init()
-            
-            # Reinitialize mic monitoring
-            self.setup_mic_monitoring()
-            
-            # Reset all flags
-            self.is_speaking = False
-            self.is_processing = False
-            self.stop_generation = False
-            self.current_audio_playing = False
-            
-            print("\nAudio system reinitialized successfully")
-        except Exception as e:
-            print(f"Error reinitializing audio system: {e}")
-
-    def aggressive_cleanup(self):
-        """Enhanced aggressive cleanup."""
-        self.current_sentence = ""
-        self.last_transcript = ""
-        self.last_final_transcript = ""
-        self.last_sentence_complete = False
-        self.last_interim_timestamp = time.time()
-        self.current_interrupt_buffer = ""
-        self.last_interrupt_buffer_update = time.time()
-        
-        # Clear audio queue
-        while not self.audio_queue.empty():
-            try:
-                self.audio_queue.get_nowait()
-            except queue.Empty:
-                break
-        
-        # Force reset recognition state
-        if hasattr(self, 'client'):
-            try:
-                self.streaming_config = speech.StreamingRecognitionConfig(
-                    config=self.config,
-                    interim_results=True
-                )
-            except Exception as e:
-                print(f"Error resetting recognition state: {e}")
-        
-        # Reset all timing variables
-        self._last_transcript_time = time.time()
-        self._last_processing_time = time.time()
-        self._last_state = None
+    def process_audio_stream(self):
+        """Delegate to AudioProcessor"""
+        self.processor.process_audio_stream()
 
 def main():
     try:
@@ -1220,7 +299,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
