@@ -113,14 +113,21 @@ def main():
 
     def handle_interrupt_and_clearing():
         """Handle interruption by stopping playback, clearing queues, and resetting state."""
-        # Set a flag to prevent new audio from being queued
+        # Immediately prevent new processing
         state_manager.transition_to(ListeningState.INTERRUPT_ONLY)
+        
+        # Cancel any pending processing timer
+        if processing_timer:
+            processing_timer.cancel()
         
         # First stop and clear TTS audio
         tts_handler.stop_playback()
         
         # Longer pause to ensure audio has stopped
         time.sleep(0.2)
+        
+        # Clear STT state before playing acknowledgment
+        stt_handler.clear_state()
         
         # Play interrupt acknowledgment with retry mechanism
         max_retries = 3
@@ -140,14 +147,22 @@ def main():
                 print(f"Retry {attempt + 1}/{max_retries}: {e}")
                 time.sleep(0.1)
         
-        # Clear STT buffers and reset recognition
+        # Double-check TTS has stopped and clear again
+        tts_handler.stop_playback()
+        
+        # Clear STT buffers and reset recognition again
         stt_handler.clear_state()
         
-        # Reset state manager
+        # Reset state manager and clear any accumulated text
         state_manager.reset_text()
+        accumulated_text = ""
         
         # Brief pause before resuming
         time.sleep(0.1)
+        
+        # Final cleanup pass
+        tts_handler.stop_playback()
+        stt_handler.clear_state()
         
         # Ensure state transition happens after cleanup
         state_manager.transition_to(ListeningState.FULL_LISTENING)
