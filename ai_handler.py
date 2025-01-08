@@ -1,77 +1,63 @@
 from openai import OpenAI
-import os
-from dotenv import load_dotenv
+from typing import Iterator
+from dataclasses import dataclass
 
-class AIHandler:
+@dataclass
+class ChatConfig:
+    """Configuration for chat completion"""
+    model_name: str = "gpt-4"
+    temperature: float = 0.7
+
+@dataclass
+class AnalysisConfig:
+    """Configuration for sentence analysis"""
+    model_name: str = "gpt-4"
+    temperature: float = 0
+
+class OpenAIService:
     def __init__(self):
-        # Load environment variables
-        load_dotenv()
-        
-        # Initialize OpenAI client
-        self.openai_client = OpenAI()
-        
-        # Set the model
-        self.model = "gpt-4o-mini"  
+        self.client = OpenAI()  # Will use OPENAI_API_KEY from environment
 
-    def get_ai_response(self, user_input):
-        """Get AI response for user input."""
+    def analyze_completion(self, text: str, config: AnalysisConfig) -> bool:
+        """Analyze if the given text forms a complete thought/sentence."""
         try:
-            # Get response from OpenAI with system and user messages
-            response = self.openai_client.chat.completions.create(
-                model=self.model,
+            response = self.client.chat.completions.create(
+                model=config.model_name,
                 messages=[
-                    {"role": "system", "content": """You are a helpful AI assistant engaged in verbal conversation. 
-                    Keep your responses natural, concise, and conversational. 
-                    Aim to be informative while maintaining a friendly tone.
-                    Avoid overly long or technical responses unless specifically asked.
-                    If you're not sure about something, it's okay to say so."""},
-                    {"role": "user", "content": user_input}
+                    {"role": "system", "content": "You are a sentence completion analyzer. "
+                     "Respond with ONLY 'true' or 'false' to indicate if the input forms a complete thought."},
+                    {"role": "user", "content": text}
                 ],
-                temperature=0.7,
+                temperature=config.temperature
+            )
+            return response.choices[0].message.content.strip().lower() == 'true'
+        except Exception as e:
+            print(f"Analysis error: {e}")
+            return False
+
+    def generate_chat_response(self, text: str, config: ChatConfig) -> Iterator[str]:
+        """Generate streaming chat response with improved chunking."""
+        try:
+            response = self.client.chat.completions.create(
+                model=config.model_name,
+                messages=[
+                    {"role": "system", "content": "You are a helpful AI assistant engaged in verbal conversation. "
+                     "Keep responses natural and concise. Use proper punctuation."},
+                    {"role": "user", "content": text}
+                ],
+                temperature=config.temperature,
                 stream=True
             )
-            
-            # Stream the response
-            for chunk in response:
-                if chunk.choices[0].delta.content is not None:
-                    content = chunk.choices[0].delta.content
-                    yield content
-            
-        except Exception as e:
-            print(f"Error getting AI response: {e}")
-            yield "I apologize, but I encountered an error. Could you please repeat that?"
 
-    def is_sentence_complete(self, text):
-        """Check if the sentence is complete."""
-        try:
-            # Add timeout to prevent hanging
-            response = self.openai_client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": """You are a sentence completion analyzer.
-                    Analyze if the given text forms a complete thought or sentence.
-                    Consider:
-                    - Grammatical completeness
-                    - Semantic completeness
-                    - Natural ending (proper punctuation)
-                    - No trailing indicators or incomplete phrases
+            buffer = ""
+            for chunk in response:
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    buffer += content
+                    yield content
                     
-                    Respond with ONLY 'true' or 'false' (lowercase)."""},
-                    {"role": "user", "content": f"Is this a complete sentence: '{text}'"}
-                ],
-                timeout=5  # 5 second timeout
-            )
-            
-            # Get the response and ensure it's either 'true' or 'false'
-            result = response.choices[0].message.content.lower().strip()
-            
-            # Validate the response
-            if result not in ['true', 'false']:
-                print(f"Invalid response from OpenAI: {result}")
-                return False
-            
-            return result == 'true'
-            
         except Exception as e:
-            print(f"Error analyzing text: {e}")
-            return False  # Default to false on error
+            yield f"Error: {str(e)}"
+
+def create_default_service() -> OpenAIService:
+    return OpenAIService()

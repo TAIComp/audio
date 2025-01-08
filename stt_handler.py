@@ -1,117 +1,138 @@
 from google.cloud import speech
+from typing import Optional, Callable
 import queue
-import pyaudio
+import threading
+from dataclasses import dataclass
 import time
-from datetime import datetime
 
-class STTHandler:
-    def __init__(self):
-        # Initialize the Speech client
+@dataclass
+class STTConfig:
+    """Configuration for speech-to-text processing"""
+    language_code: str = "en-US"
+    sample_rate: int = 16000
+    enable_interim: bool = True
+    enable_punctuation: bool = True
+
+class SpeechToTextHandler:
+    def __init__(self, config: Optional[STTConfig] = None):
+        self.config = config or STTConfig()
         self.client = speech.SpeechClient()
-        
-        # Initialize audio parameters
-        self.RATE = 16000
-        self.CHUNK = int(self.RATE / 10)  # 100ms chunks
-        
-        # Create a thread-safe queue for audio data
         self.audio_queue = queue.Queue()
+        self.is_listening = False
+        self.should_stop = threading.Event()
+        self.current_transcript = ""
+        self.stream_reset_requested = False
+        self.stream_active = True
         
-        # Configure audio recording parameters
-        self.config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=self.RATE,
-            language_code="en-US",
-            enable_automatic_punctuation=True,
-        )
+        # Callbacks for handling transcripts
+        self.partial_transcript_callback: Optional[Callable[[str], None]] = None
+        self.final_transcript_callback: Optional[Callable[[str], None]] = None
 
-        self.streaming_config = speech.StreamingRecognitionConfig(
-            config=self.config,
-            interim_results=True
-        )
+    def start_recognition(self) -> None:
+        """Start speech recognition in background thread."""
+        if not self.is_listening:
+            self.should_stop.clear()
+            self.recognition_thread = threading.Thread(
+                target=self._process_audio_stream,
+                daemon=True
+            )
+            self.recognition_thread.start()
+            self.is_listening = True
 
-    def get_audio_input(self):
-        """Initialize audio input with error handling and device selection."""
-        try:
-            audio = pyaudio.PyAudio()
-            
-            # List available input devices
-            info = audio.get_host_api_info_by_index(0)
-            numdevices = info.get('deviceCount')
-            
-            # Find default input device
-            default_input = None
-            for i in range(numdevices):
-                device_info = audio.get_device_info_by_index(i)
-                if device_info.get('maxInputChannels') > 0:
-                    if device_info.get('defaultSampleRate') == self.RATE:
-                        default_input = i
-            
-            if default_input is None:
-                default_input = audio.get_default_input_device_info()['index']
-            
-            # Open the audio stream with explicit device selection
-            stream = audio.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=self.RATE,
-                input=True,
-                input_device_index=default_input,
-                frames_per_buffer=self.CHUNK,
-                stream_callback=self._fill_queue
+    def _process_audio_stream(self) -> None:
+        """Process audio stream and emit transcripts."""
+        while self.stream_active:
+            config = speech.RecognitionConfig(
+                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=self.config.sample_rate,
+                language_code=self.config.language_code,
+                enable_automatic_punctuation=self.config.enable_punctuation,
+                use_enhanced=True
             )
             
-            if not stream.is_active():
-                stream.start_stream()
+            streaming_config = speech.StreamingRecognitionConfig(
+                config=config,
+                interim_results=self.config.enable_interim,
+                single_utterance=False
+            )
+
+            def audio_generator():
+                while not self.should_stop.is_set():
+                    try:
+                        chunk = self.audio_queue.get(timeout=0.1)
+                        if chunk is None:
+                            self.stream_reset_requested = True
+                            return
+                        if self.stream_reset_requested:
+                            continue
+                        yield speech.StreamingRecognizeRequest(audio_content=chunk)
+                    except queue.Empty:
+                        continue
+
+            try:
+                responses = self.client.streaming_recognize(streaming_config, audio_generator())
                 
-            return stream, audio
+                for response in responses:
+                    if self.should_stop.is_set() or self.stream_reset_requested:
+                        break
+
+                    if response.results:
+                        result = response.results[0]
+                        transcript = result.alternatives[0].transcript
+
+                        if result.is_final:
+                            if self.final_transcript_callback:
+                                self.final_transcript_callback(transcript)
+                        else:
+                            if self.partial_transcript_callback:
+                                self.partial_transcript_callback(transcript)
+                                
+            except Exception as e:
+                print(f"Stream error, restarting: {e}")
+                continue
             
-        except Exception as e:
-            print(f"\nError initializing audio input: {e}")
-            print("Please check if your microphone is properly connected and permissions are set correctly.")
-            print("You may need to grant microphone access to the application.")
-            raise
+            if self.stream_reset_requested:
+                self.stream_reset_requested = False
 
-    def _fill_queue(self, in_data, frame_count, time_info, status_flags):
-        """Callback to fill the audio queue with incoming audio data."""
-        self.audio_queue.put(in_data)
-        return None, pyaudio.paContinue
+    def add_audio_data(self, audio_chunk: bytes) -> None:
+        """Add audio data to processing queue."""
+        if self.is_listening:
+            self.audio_queue.put(audio_chunk)
 
-    def audio_input_stream(self):
-        """Generator that yields audio data from the queue."""
-        while True:
-            data = self.audio_queue.get()
-            if data is None:
-                break
-            yield data
+    def stop_recognition(self) -> None:
+        """Stop speech recognition."""
+        self.should_stop.set()
+        self.audio_queue.put(None)
 
-    def get_streaming_requests(self):
-        """Generate streaming requests from audio input."""
-        return (
-            speech.StreamingRecognizeRequest(audio_content=content)
-            for content in self.audio_input_stream()
-        )
 
-    def start_recognition(self):
-        """Start the streaming recognition process."""
-        try:
-            stream, audio = self.get_audio_input()
-            
-            requests = self.get_streaming_requests()
-            responses = self.client.streaming_recognize(
-                self.streaming_config,
-                requests
-            )
-            
-            return stream, audio, responses
-            
-        except Exception as e:
-            print(f"Error in speech recognition: {e}")
-            raise
-
-    def clear_audio_queue(self):
-        """Clear the audio queue."""
+    def clear_state(self) -> None:
+        """Clear internal state and audio queue."""
+        # Clear the audio queue
         while not self.audio_queue.empty():
             try:
                 self.audio_queue.get_nowait()
             except queue.Empty:
-                break 
+                break
+        
+        # Clear current transcript
+        self.current_transcript = ""
+        
+        # Force stream reset
+        self.stream_reset_requested = True
+        self.audio_queue.put(None)
+        
+        # Wait for stream reset to complete
+        time.sleep(0.1)  # Brief pause to ensure reset
+        
+        # Clear any remaining audio data
+        while not self.audio_queue.empty():
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def cleanup(self) -> None:
+        """Cleanup STT resources."""
+        self.stream_active = False
+        self.should_stop.set()
+        self.audio_queue.put(None)

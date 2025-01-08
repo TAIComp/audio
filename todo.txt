@@ -1,1 +1,113 @@
+my code curently should show only 1 time Listening .... and wait for user input. 
+
+
+System Overview & States
+The system operates in two main states:
+FULL_LISTENING: The default state where it listens for all user input
+INTERRUPT_ONLY: Active when sentnece is deemed complete and send to main ai model, only listens for interrupt commands
+Detailed Process Flow
+1. Initial Listening Phase
+System starts in FULL_LISTENING state
+Microphone constantly captures audio in small chunks (100ms)
+Google Speech-to-Text converts these chunks to text in real-time
+As user speaks, interim transcripts are generated and monitored
+2. Sentence Completion Analysis
+When speech is detected, the system:
+Accumulates text until a pause is detected
+Sends text to the AI analysis model to check if it's a complete sentence
+Gets back true/false response
+If TRUE: Waits 1 second before processing
+If FALSE: Waits 2 seconds for potential additional speech
+This prevents premature processing of incomplete thoughts
+3. AI Processing Phase
+Once a sentence is deemed complete:
+System switches to INTERRUPT_ONLY state
+Sends text to main AI model (GPT-4)
+Receives response in chunks (streaming text)
+Each chunk is immediately:
+Converted to speech
+2. Queued for playback
+Played through speakers
+This creates a more natural, flowing conversation
+4. Interruption Handling
+Voice Interruptions
+System maintains a list of interrupt phrases like:
+"stop"
+"please stop"
+"shut up"
+"end"
+"silence"
+etc.
+During INTERRUPT_ONLY state, all speech is checked against these phrases
+When detected:
+1. Immediately stops current audio
+Plays short acknowledgment sound
+Clears all queued audio
+Returns to FULL_LISTENING state
 .
+
+
+
+
+in the end i want to see something like this:
+(venv) manu@manu-HP-ProBook-440-G8-Notebook-PC:~/Desktop/audio$ python audio.py
+
+Starting audio transcription... Speak into your microphone.
+Press ` (backtick) to interrupt at any time.
+Listening... (Press ` to interrupt)
+
+Final: "hello."
+
+Processing triggered - Sentence complete: True, Silence: 1.0s
+
+Changing state to INTERRUPT_ONLY for processing
+
+Listening... (Press ` to interrupt)
+
+Listening... (Press ` to interrupt)
+
+Final: "how are you?"
+
+Processing triggered - Sentence complete: True, Silence: 1.0s
+
+Changing state to INTERRUPT_ONLY for processing
+
+Listening... (Press ` to interrupt)
+
+Listening... (Press ` to interrupt)
+
+Final: "let's talk about some quantum physics."
+
+Processing triggered - Sentence complete: True, Silence: 1.1s
+
+Changing state to INTERRUPT_ONLY for processing
+
+Interrupt command detected: 'shut up.'
+
+Listening... (Press ` to interrupt)
+
+Listening... (Press ` to interrupt)
+
+
+
+
+
+i am getting this:
+(venv) manu@manu-HP-ProBook-440-G8-Notebook-PC:~/Desktop/audio$ python main.py
+pygame 2.6.1 (SDL 2.28.4, Python 3.12.3)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+Looking for credentials at: /home/manu/Desktop/audio/beaming-source-446514-s8-14ddee96f549.json
+Testing Google Cloud credentials...
+Successfully created Speech client
+
+
+
+Starting audio transcription... Speak into your microphone.
+Press ` (backtick) to interrupt at any time.
+Listening... (Press ` to interrupt)
+
+Watchdog monitor started
+Speech recognition started.
+Audio controller started successfully
+
+Listening... (Press ` to interrupt)

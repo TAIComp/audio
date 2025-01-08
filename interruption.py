@@ -1,15 +1,10 @@
+from pathlib import Path
 import pygame
 import time
-from pathlib import Path
-import queue
-from enum import Enum
-
-class ListeningState(Enum):
-    FULL_LISTENING = "full_listening"
-    INTERRUPT_ONLY = "interrupt_only"
+from typing import Optional, Callable
 
 class InterruptionHandler:
-    def __init__(self):
+    def __init__(self, interrupt_audio_path: Path = Path("interruption.mp3")):
         self.interrupt_commands = {
             "stop", "end", "shut up",
             "please stop", "stop please",
@@ -20,99 +15,61 @@ class InterruptionHandler:
             "would you stop", "can you be quiet",
             "silence", "pause"
         }
-        self.last_interrupt_time = time.time()
-        self.interrupt_cooldown = 1.0  # 1 second cooldown between interrupts
-        self.interrupt_audio_path = Path("interruption.mp3")
-        
-        if not self.interrupt_audio_path.exists():
-            print(f"Warning: Interrupt audio file '{self.interrupt_audio_path}' not found!")
+        self.interrupt_audio_path = interrupt_audio_path
+        self.last_interrupt_time = 0
+        self.interrupt_cooldown = 1.0
+        self.keyboard_interrupt_key = '`'
+        self._initialize_audio()
 
-    def handle_keyboard_interrupt(self, audio_instance):
-        """Handle keyboard interruption."""
-        current_time = time.time()
-        if current_time - self.last_interrupt_time >= self.interrupt_cooldown:
-            print("\nBacktick interrupt detected!")
-            self.handle_interrupt(audio_instance, "keyboard")
-            # Clear audio queue and force a small delay
-            audio_instance.audio_queue.queue.clear()
-            time.sleep(0.2)  # Small delay to ensure clean state
+    def _initialize_audio(self) -> None:
+        try:
+            if pygame.mixer.get_init():
+                pygame.mixer.quit()
+            pygame.mixer.init(frequency=44100)
+        except Exception as e:
+            print(f"Error initializing pygame mixer: {e}")
 
-    def handle_interrupt(self, audio_instance, interrupt_type):
-        """Common interrupt handling logic."""
+    def handle_keyboard_interrupt(self, key: str) -> bool:
+        """Handle keyboard interruption event."""
+        if key == self.keyboard_interrupt_key:
+            return self.handle_interrupt()
+        return False
+
+    def handle_interrupt(self) -> bool:
+        """Handle an interruption event."""
         try:
             current_time = time.time()
             if current_time - self.last_interrupt_time >= self.interrupt_cooldown:
-                # Stop any ongoing audio playback
-                if pygame.mixer.music.get_busy():
-                    pygame.mixer.music.stop()
+                if self.interrupt_audio_path.exists():
+                    pygame.mixer.music.load(str(self.interrupt_audio_path))
+                    pygame.mixer.music.play()
+                    while pygame.mixer.music.get_busy():
+                        pygame.time.Clock().tick(10)
                     pygame.mixer.music.unload()
-                    
-                # Use cleanup_handler instead of direct aggressive_cleanup
-                audio_instance.cleanup_handler.aggressive_cleanup()
                 
-                # Clear audio queue before playing acknowledgment
-                while not audio_instance.audio_queue.empty():
-                    try:
-                        audio_instance.audio_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    
-                self.play_acknowledgment()
-                
-                # Use cleanup_handler again
-                audio_instance.cleanup_handler.aggressive_cleanup()
-                
-                # Add small delay and clear queue again after acknowledgment
-                time.sleep(0.3)
-                while not audio_instance.audio_queue.empty():
-                    try:
-                        audio_instance.audio_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                
-                # Signal to stop AI response generation
-                audio_instance.stop_generation = True
-                
-                # Reset all states
-                audio_instance.is_speaking = False
-                audio_instance.current_audio_playing = False
-                audio_instance.is_processing = False
-                audio_instance.pending_response = None
-                audio_instance.listening_state = ListeningState.FULL_LISTENING
-                
-                audio_instance.state.reset_state()
                 self.last_interrupt_time = current_time
-                
-                # Final cleanup using cleanup_handler
-                audio_instance.cleanup_handler.aggressive_cleanup()
-                print("\nListening... (Press ` to interrupt)")
-                
+                return True
+            return False
+            
         except Exception as e:
-            print(f"Error during interrupt handling: {e}")
+            print(f"Error handling interrupt: {e}")
+            return False
 
-    def play_acknowledgment(self):
-        """Play the prerecorded acknowledgment audio."""
+    def is_interrupt_command(self, text: str) -> bool:
+        """Check if the given text contains an interrupt command."""
+        text = text.lower().strip()
+        # Check for exact matches
+        if text in self.interrupt_commands:
+            return True
+        # Check for partial matches (if command appears anywhere in the text)
+        return any(cmd in text for cmd in self.interrupt_commands)
+
+    def cleanup(self) -> None:
+        """Clean up pygame mixer resources."""
         try:
-            # Stop any currently playing audio
-            if pygame.mixer.music.get_busy():
+            if pygame.mixer.get_init():
                 pygame.mixer.music.stop()
                 pygame.mixer.music.unload()
-            
-            # Verify file exists
-            if not self.interrupt_audio_path.exists():
-                print(f"Error: Interruption audio file not found at {self.interrupt_audio_path}")
-                return
-            
-            # Load and play the interruption audio
-            pygame.mixer.music.load(str(self.interrupt_audio_path))
-            pygame.mixer.music.play()
-            
-            # Wait for the interruption audio to finish
-            while pygame.mixer.music.get_busy():
-                pygame.time.Clock().tick(10)
-            
-            # Cleanup
-            pygame.mixer.music.unload()
-            
+                pygame.mixer.quit()
         except Exception as e:
-            print(f"Error playing acknowledgment: {e}") 
+            print(f"Error during interrupt cleanup: {e}")
