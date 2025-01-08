@@ -115,14 +115,14 @@ def main():
         # First stop and clear TTS audio
         tts_handler.stop_playback()
         
+        # Play interrupt acknowledgment
+        interruption_handler.handle_interrupt()
+        
         # Clear STT buffers and reset recognition
         stt_handler.clear_state()
         
         # Reset state manager
         state_manager.reset_text()
-        
-        # Play interrupt acknowledgment after clearing everything
-        interruption_handler.handle_interrupt()
         
         # Ensure state transition happens after cleanup
         state_manager.transition_to(ListeningState.FULL_LISTENING)
@@ -176,8 +176,7 @@ def main():
         try:
             if key.char == '`' and state_manager.current_state == ListeningState.INTERRUPT_ONLY:
                 print("\nKeyboard interrupt detected!")
-                # Use threading to handle keyboard interrupt the same way as voice interrupt
-                threading.Thread(target=handle_interrupt_and_clearing, daemon=True).start()
+                handle_interrupt_and_clearing()
         except AttributeError:
             # Special key pressed, ignore
             pass
