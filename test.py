@@ -11,6 +11,7 @@ from interruption import InterruptionHandler
 import os
 import threading
 from pynput import keyboard as kb
+import pygame
 
 def main():
     # Initialize configurations and handlers
@@ -112,11 +113,32 @@ def main():
 
     def handle_interrupt_and_clearing():
         """Handle interruption by stopping playback, clearing queues, and resetting state."""
+        # Set a flag to prevent new audio from being queued
+        state_manager.transition_to(ListeningState.INTERRUPT_ONLY)
+        
         # First stop and clear TTS audio
         tts_handler.stop_playback()
         
-        # Play interrupt acknowledgment
-        interruption_handler.handle_interrupt()
+        # Longer pause to ensure audio has stopped
+        time.sleep(0.2)
+        
+        # Play interrupt acknowledgment with retry mechanism
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                interruption_handler.handle_interrupt()
+                
+                # Wait for acknowledgment audio to complete with timeout
+                start_time = time.time()
+                while pygame.mixer.music.get_busy():
+                    pygame.time.Clock().tick(10)
+                    if time.time() - start_time > 2.0: # 2-second timeout
+                        pygame.mixer.music.stop()
+                        break
+                break
+            except Exception as e:
+                print(f"Retry {attempt + 1}/{max_retries}: {e}")
+                time.sleep(0.1)
         
         # Clear STT buffers and reset recognition
         stt_handler.clear_state()
@@ -124,11 +146,11 @@ def main():
         # Reset state manager
         state_manager.reset_text()
         
+        # Brief pause before resuming
+        time.sleep(0.1)
+        
         # Ensure state transition happens after cleanup
         state_manager.transition_to(ListeningState.FULL_LISTENING)
-        
-        # Brief pause to ensure everything is reset
-        time.sleep(0.1)
         
         print("\nReady for new input...")
 

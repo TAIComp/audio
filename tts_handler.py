@@ -6,6 +6,7 @@ import queue
 import threading
 import pygame
 import os
+import time
 
 @dataclass
 class TTSConfig:
@@ -40,6 +41,7 @@ class TextToSpeechHandler:
     def stream_text_to_speech(self, text_stream: Iterator[str]) -> None:
         """Process streaming text input with immediate playback."""
         current_sentence = ""
+        
         for text_chunk in text_stream:
             current_sentence += text_chunk
             sentences = self._split_into_sentences(current_sentence)
@@ -51,7 +53,7 @@ class TextToSpeechHandler:
                         audio_path = self._generate_speech(sentence)
                         self.audio_queue.put(audio_path)
                         
-                        # Start playback immediately for first sentence
+                        # Start playback immediately if this is the first sentence
                         if self.is_first_sentence:
                             self.is_first_sentence = False
                             self._start_playback()
@@ -63,6 +65,7 @@ class TextToSpeechHandler:
             audio_path = self._generate_speech(current_sentence)
             self.audio_queue.put(audio_path)
             if self.is_first_sentence:
+                self.is_first_sentence = False
                 self._start_playback()
 
     def _generate_speech(self, text: str) -> Path:
@@ -131,19 +134,49 @@ class TextToSpeechHandler:
     def stop_playback(self) -> None:
         """Stop current audio playback and clear audio queue."""
         self._should_stop = True
-        self.is_playing = False
         
-        # Stop current playback
-        if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
-            pygame.mixer.music.stop()
-            pygame.mixer.music.unload()
+        # Stop current playback with retry mechanism
+        max_retries = 3
+        for _ in range(max_retries):
+            if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
+                pygame.mixer.music.stop()
+                pygame.mixer.music.unload()
+                time.sleep(0.1)  # Small delay to ensure stop completes
+            if not (pygame.mixer.get_init() and pygame.mixer.music.get_busy()):
+                break
         
-        # Clear the audio queue
+        # Clear the audio queue and delete files with verification
+        deleted_files = set()
         while not self.audio_queue.empty():
             try:
                 audio_path = self.audio_queue.get_nowait()
-                if audio_path and audio_path.exists():
-                    audio_path.unlink()  # Delete the audio file
+                if audio_path and isinstance(audio_path, Path):
+                    if audio_path.exists():
+                        try:
+                            audio_path.unlink()  # Delete the audio file
+                            deleted_files.add(audio_path)
+                        except Exception as e:
+                            print(f"Error deleting file {audio_path}: {e}")
+            except queue.Empty:
+                break
+        
+        # Verify all files are deleted
+        for file_path in deleted_files:
+            if file_path.exists():
+                try:
+                    file_path.unlink()
+                except Exception:
+                    pass
+        
+        # Reset internal state
+        self.is_playing = False
+        self.is_first_sentence = True
+        self.sentence_buffer = []
+        
+        # Clear the queue one more time
+        while not self.audio_queue.empty():
+            try:
+                self.audio_queue.get_nowait()
             except queue.Empty:
                 break
 
